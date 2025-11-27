@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <title>Liveness Check (Blink + Move)</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="container">
+      <h1>Liveness Verification</h1>
+      <p class="sub">Client-side only. No images stored or sent.</p>
+
+      <div class="stage">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="overlay"></canvas>
+        <div id="status" class="status">Initializing…</div>
+      </div>
+
+      <div class="controls">
+        <button id="startBtn">Start Camera</button>
+        <button id="stopBtn" disabled>Stop</button>
+      </div>
+
+      <div class="requirements">
+        <strong>Dynamic Challenge Sequence:</strong>
+        <ul id="challengeList">
+          <!-- Filled dynamically: e.g., Blink x2, Turn Left, Turn Right, Open Mouth, Move Forward -->
+        </ul>
+        <p id="challengeStatus" class="result">Awaiting start…</p>
+        <p id="result" class="result"></p>
+      </div>
+    </div>
+
+    <script type="module" src="script.js"></script>
+  </body>
+  </html>
