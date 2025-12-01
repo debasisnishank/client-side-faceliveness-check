@@ -13,24 +13,30 @@
       <h1>Liveness Verification</h1>
       <p class="sub">Client-side only. No images stored or sent.</p>
 
-      <div class="stage">
-        <video id="video" autoplay playsinline muted></video>
-        <canvas id="overlay"></canvas>
-        <div id="status" class="status">Initializing…</div>
-      </div>
+      <div class="main-layout">
+        <div class="camera-col">
+          <div class="stage">
+            <video id="video" autoplay playsinline muted></video>
+            <canvas id="overlay"></canvas>
+            <div id="status" class="status">Initializing…</div>
+          </div>
 
-      <div class="controls">
-        <button id="startBtn">Start Camera</button>
-        <button id="stopBtn" disabled>Stop</button>
-      </div>
+          <div class="controls">
+            <button id="startBtn">Start Camera</button>
+            <button id="stopBtn" disabled>Stop</button>
+          </div>
+        </div>
 
-      <div class="requirements">
-        <strong>Dynamic Challenge Sequence:</strong>
-        <ul id="challengeList">
-          <!-- Filled dynamically: e.g., Blink x2, Turn Left, Turn Right, Open Mouth, Move Forward -->
-        </ul>
-        <p id="challengeStatus" class="result">Awaiting start…</p>
-        <p id="result" class="result"></p>
+        <div class="instructions-col">
+          <div class="requirements">
+            <strong>Challenge Sequence:</strong>
+            <ul id="challengeList">
+              <!-- Filled dynamically -->
+            </ul>
+            <p id="challengeStatus" class="result">Awaiting start…</p>
+            <p id="result" class="result"></p>
+          </div>
+        </div>
       </div>
     </div>
 

@@ -8,11 +8,12 @@ const CONFIG = {
   calibrationFrames: 40,          // frames to compute average open-eye EAR
   earFramesClosed: 3,             // consecutive closed frames to count blink
   minOpenFramesAfterBlink: 2,     // ensure eye reopened before next blink
-  moveThresholdRatio: 0.05,       // fraction of face width for movement
-  moveMinFrames: 4,               // require movement persistence
+  moveThresholdRatio: 0.08,       // fraction of face width for movement (8% is more achievable)
+  moveMinFrames: 5,               // require movement persistence (reduced from 8)
+  movementCalibrationFrames: 15,  // frames to establish stable center position (reduced from 20)
   timeLimitSec: 45,               // verification timeout
   smoothAlpha: 0.3,               // smoothing factor for EAR
-  debug: false                    // set true to log details
+  debug: true                     // set true to log details
 };
 
 // Elements
@@ -53,11 +54,18 @@ let earAverageOpen = 0;
 let smoothEAR = null;
 
 // Movement detection state
-let faceCenter0 = null; // initial center
+let faceCenter0 = null; // initial center (calibrated average)
+let faceCenterHistory = []; // history for calibration
+let movementCalibrated = false;
 let movedLeft = false;
 let movedRight = false;
 let moveLeftFrames = 0;
 let moveRightFrames = 0;
+let returnedToCenter = true; // must be at center before movement counts
+
+// Head pose estimation state
+let baseYaw = null; // calibrated yaw (left/right rotation)
+let yawHistory = [];
 
 // Eye landmark indices (MediaPipe FaceMesh style)
 const LEFT_EYE = [33, 160, 158, 133, 153, 144];
@@ -65,6 +73,18 @@ const RIGHT_EYE = [362, 385, 387, 263, 373, 380];
 
 // Utility
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+// Extract yaw (left/right rotation) from transformation matrix
+function getYawFromMatrix(matrix) {
+  // Matrix is a 4x4 transformation matrix in column-major order
+  // Extract rotation components
+  const m00 = matrix.data[0];
+  const m02 = matrix.data[2];
+  
+  // Calculate yaw angle in radians, then convert to degrees
+  const yaw = Math.atan2(m02, m00) * (180 / Math.PI);
+  return yaw;
+}
 function computeEAR(lms, ids) {
   const p1 = lms[ids[0]], p2 = lms[ids[1]], p3 = lms[ids[2]], p4 = lms[ids[3]], p5 = lms[ids[4]], p6 = lms[ids[5]];
   const vertical = dist(p2, p6) + dist(p3, p5);
@@ -112,7 +132,8 @@ async function ensureModels() {
     },
     runningMode: "VIDEO",
     numFaces: 1,
-    outputFaceBlendshapes: false,
+    outputFaceBlendshapes: true, // Enable blend shapes for mouth/smile detection
+    outputFacialTransformationMatrixes: true, // Enable head pose estimation
   });
 }
 
@@ -221,9 +242,14 @@ function resetSession() {
   earAverageOpen = 0;
   smoothEAR = null;
   faceCenter0 = null;
+  faceCenterHistory = [];
+  movementCalibrated = false;
   movedLeft = movedRight = false;
   moveLeftFrames = 0;
   moveRightFrames = 0;
+  returnedToCenter = true;
+  baseYaw = null;
+  yawHistory = [];
   startDeadline = CONFIG.timeLimitSec > 0 ? performance.now() + CONFIG.timeLimitSec * 1000 : 0;
   CONFIG.earThreshold = null; // reset calibration
   spoofFlagged = false;
@@ -255,19 +281,86 @@ function buildChallengeSequence() {
   return actions;
 }
 
-function renderChallengeList() {
+function renderChallengeList(progressPercent = null) {
   if (!challengeListEl) return;
   challengeListEl.innerHTML = '';
   challengeSequence.forEach((c, idx) => {
     const li = document.createElement('li');
-    li.textContent = c.label + (c.done ? ' ✓' : '');
-    li.style.color = c.done ? '#17c964' : '#a5adba';
-    if (idx === currentChallengeIndex && !c.done) {
+    let text = c.label;
+    
+    if (c.done) {
+      text += ' ✓';
+      li.style.color = '#17c964';
+    } else if (idx === currentChallengeIndex) {
+      // Show percentage for active challenge
+      if (progressPercent !== null && progressPercent > 0) {
+        text += ` (${Math.round(progressPercent)}%)`;
+      }
       li.style.fontWeight = '600';
       li.style.color = '#00d0ff';
+      
+      // Add progress bar
+      if (progressPercent !== null) {
+        const progressBar = document.createElement('div');
+        progressBar.style.cssText = 'height: 4px; background: rgba(0,208,255,0.2); border-radius: 2px; margin-top: 4px; overflow: hidden;';
+        const progressFill = document.createElement('div');
+        progressFill.style.cssText = `height: 100%; background: #00d0ff; width: ${progressPercent}%; transition: width 0.2s ease;`;
+        progressBar.appendChild(progressFill);
+        li.appendChild(document.createElement('br'));
+        li.appendChild(progressBar);
+      }
+    } else {
+      li.style.color = '#a5adba';
     }
+    
+    li.textContent = text;
+    if (idx === currentChallengeIndex && progressPercent !== null && progressPercent > 0) {
+      // Re-add progress bar after textContent (which clears innerHTML)
+      const progressBar = document.createElement('div');
+      progressBar.style.cssText = 'height: 4px; background: rgba(0,208,255,0.2); border-radius: 2px; margin-top: 4px; overflow: hidden;';
+      const progressFill = document.createElement('div');
+      progressFill.style.cssText = `height: 100%; background: #00d0ff; width: ${progressPercent}%; transition: width 0.2s ease;`;
+      progressBar.appendChild(progressFill);
+      li.appendChild(progressBar);
+    }
+    
     challengeListEl.appendChild(li);
   });
+}
+
+function getChallengeProgress() {
+  const currentKey = challengeSequence[currentChallengeIndex]?.key;
+  if (!currentKey) return 0;
+  
+  let current = 0;
+  let required = 0;
+  
+  switch (currentKey) {
+    case 'blink':
+      current = blinkCount;
+      required = CONFIG.requiredBlinks;
+      break;
+    case 'turnLeft':
+      if (!movementCalibrated) return 0; // Still calibrating
+      current = moveLeftFrames;
+      required = CONFIG.moveMinFrames;
+      break;
+    case 'turnRight':
+      if (!movementCalibrated) return 0; // Still calibrating
+      current = moveRightFrames;
+      required = CONFIG.moveMinFrames;
+      break;
+    case 'mouth':
+      current = mouthOpenFrames;
+      required = 4;
+      break;
+    case 'forward':
+      current = forwardMoveFrames;
+      required = 2;
+      break;
+  }
+  
+  return Math.min((current / required) * 100, 100);
 }
 
 function advanceChallengeIf(conditionMet) {
@@ -281,7 +374,7 @@ function advanceChallengeIf(conditionMet) {
     challengeCompleted = true;
     setChallengeStatus('All challenges done.', 'ok');
   }
-  renderChallengeList();
+  renderChallengeList(0); // Reset progress for next challenge
 }
 
 let startDeadline = 0;
@@ -299,6 +392,26 @@ function drawOverlay(landmarks, bounds) {
 
   // Draw face bounds
   ctx.strokeRect(bounds.minX * scaleX, bounds.minY * scaleY, bounds.w * scaleX, bounds.h * scaleY);
+  
+  // Draw movement indicators
+  const currentKey = challengeSequence[currentChallengeIndex]?.key;
+  if (currentKey === 'turnLeft') {
+    ctx.fillStyle = "rgba(0,208,255,0.8)";
+    ctx.font = "bold 32px Arial";
+    ctx.fillText("←", 30, canvas.height / 2);
+  } else if (currentKey === 'turnRight') {
+    ctx.fillStyle = "rgba(0,208,255,0.8)";
+    ctx.font = "bold 32px Arial";
+    ctx.fillText("→", canvas.width - 50, canvas.height / 2);
+  } else if (currentKey === 'forward') {
+    ctx.fillStyle = "rgba(0,208,255,0.8)";
+    ctx.font = "bold 24px Arial";
+    ctx.fillText("Move Closer", canvas.width / 2 - 60, 40);
+  } else if (currentKey === 'mouth') {
+    ctx.fillStyle = "rgba(0,208,255,0.8)";
+    ctx.font = "bold 24px Arial";
+    ctx.fillText("Open Mouth", canvas.width / 2 - 60, 40);
+  }
 
   // Draw eyes
   const drawEye = (ids) => {
@@ -336,7 +449,8 @@ function updateBlink(earL, earR) {
       setStatus(`Calibration done. Blink ${CONFIG.requiredBlinks} times.`, "warn");
       if (CONFIG.debug) console.log("Calibrated EAR threshold:", CONFIG.earThreshold.toFixed(3));
     } else {
-      setStatus(`Calibrating… (${calibratedFrames}/${CONFIG.calibrationFrames})`, "warn");
+      const calProgress = Math.round((calibratedFrames / CONFIG.calibrationFrames) * 100);
+      setStatus(`Calibrating… ${calProgress}%`, "warn");
       return; // do not process blink yet
     }
   }
@@ -365,38 +479,116 @@ function updateBlink(earL, earR) {
   }
 }
 
-function updateMovement(bounds) {
-  const cx = bounds.cx;
-  if (!faceCenter0) {
-    faceCenter0 = cx;
+function updateMovement(transformationMatrix) {
+  const currentKey = challengeSequence[currentChallengeIndex]?.key;
+  
+  // Only process if a turn challenge is active
+  if (currentKey !== 'turnLeft' && currentKey !== 'turnRight') {
+    // Reset movement state when not in a turn challenge
+    yawHistory = [];
+    baseYaw = null;
+    movementCalibrated = false;
+    moveLeftFrames = 0;
+    moveRightFrames = 0;
+    returnedToCenter = true;
     return;
   }
-  const dx = cx - faceCenter0;
-  const thresh = CONFIG.moveThresholdRatio * bounds.w;
-  if (dx < -thresh) moveLeftFrames++;
-  if (dx > thresh) moveRightFrames++;
-  movedLeft = movedLeft || moveLeftFrames >= CONFIG.moveMinFrames;
-  movedRight = movedRight || moveRightFrames >= CONFIG.moveMinFrames;
-  const currentKey = challengeSequence[currentChallengeIndex]?.key;
-  if (currentKey === 'turnLeft' && movedLeft) advanceChallengeIf(true);
-  if (currentKey === 'turnRight' && movedRight) advanceChallengeIf(true);
+  
+  if (!transformationMatrix) return;
+  
+  const currentYaw = getYawFromMatrix(transformationMatrix);
+  
+  // Calibrate base yaw over several frames
+  if (!movementCalibrated) {
+    yawHistory.push(currentYaw);
+    if (yawHistory.length >= CONFIG.movementCalibrationFrames) {
+      // Calculate stable base yaw as average
+      baseYaw = yawHistory.reduce((a, b) => a + b, 0) / yawHistory.length;
+      movementCalibrated = true;
+      if (CONFIG.debug) console.log("Head pose calibrated, base yaw:", baseYaw.toFixed(1), "degrees");
+    }
+    return;
+  }
+  
+  const yawDiff = currentYaw - baseYaw;
+  const turnThreshold = 15; // degrees (was 8% of face width, now absolute angle)
+  const centerThreshold = 8; // degrees for "at center"
+  
+  // Check if user's head is at center position
+  const isAtCenter = Math.abs(yawDiff) < centerThreshold;
+  
+  if (isAtCenter) {
+    returnedToCenter = true;
+    // Decay movement counters when at center
+    moveLeftFrames = Math.max(0, moveLeftFrames - 1);
+    moveRightFrames = Math.max(0, moveRightFrames - 1);
+  }
+  
+  // Only count movement if user started from center
+  if (!returnedToCenter) {
+    return;
+  }
+  
+  // Count frames when turned left or right
+  // Negative yaw = turned left (face moving left in camera view)
+  // Positive yaw = turned right (face moving right in camera view)
+  if (yawDiff < -turnThreshold) {
+    moveLeftFrames++;
+    moveRightFrames = 0;
+    if (CONFIG.debug && moveLeftFrames % 5 === 0) console.log("Turning left:", yawDiff.toFixed(1), "deg, frames:", moveLeftFrames);
+  } else if (yawDiff > turnThreshold) {
+    moveRightFrames++;
+    moveLeftFrames = 0;
+    if (CONFIG.debug && moveRightFrames % 5 === 0) console.log("Turning right:", yawDiff.toFixed(1), "deg, frames:", moveRightFrames);
+  }
+  
+  // Check if turn left challenge is completed
+  if (currentKey === 'turnLeft' && moveLeftFrames >= CONFIG.moveMinFrames) {
+    if (CONFIG.debug) console.log("Turn LEFT completed! Final angle:", yawDiff.toFixed(1), "degrees");
+    advanceChallengeIf(true);
+    // Reset for next movement challenge
+    yawHistory = [];
+    baseYaw = null;
+    movementCalibrated = false;
+    moveLeftFrames = 0;
+    moveRightFrames = 0;
+    returnedToCenter = true;
+  }
+  
+  // Check if turn right challenge is completed
+  if (currentKey === 'turnRight' && moveRightFrames >= CONFIG.moveMinFrames) {
+    if (CONFIG.debug) console.log("Turn RIGHT completed! Final angle:", yawDiff.toFixed(1), "degrees");
+    advanceChallengeIf(true);
+    // Reset for next movement challenge
+    yawHistory = [];
+    baseYaw = null;
+    movementCalibrated = false;
+    moveLeftFrames = 0;
+    moveRightFrames = 0;
+    returnedToCenter = true;
+  }
 }
-// Mouth open detection (simple heuristic using vertical distance between upper/lower lip landmarks)
-const UPPER_LIP = 13; // landmark indices approximations (FaceMesh style)
-const LOWER_LIP = 14;
-function updateMouthOpen(landmarks, bounds) {
+// Mouth open detection using MediaPipe blend shapes
+function updateMouthOpen(blendshapes) {
   const currentKey = challengeSequence[currentChallengeIndex]?.key;
-  if (currentKey !== 'mouth') return;
-  const upper = landmarks[UPPER_LIP];
-  const lower = landmarks[LOWER_LIP];
-  if (!upper || !lower) return;
-  const mouthGap = Math.abs(lower.y - upper.y) * bounds.h; // scale gap by face height
-  if (mouthGap > bounds.h * 0.07) {
+  if (currentKey !== 'mouth' || !blendshapes) return;
+  
+  // Find jawOpen blend shape (indicates mouth opening)
+  const jawOpen = blendshapes.find(b => b.categoryName === 'jawOpen');
+  
+  if (jawOpen && jawOpen.score > 0.3) { // Threshold: 30% jaw open
     mouthOpenFrames++;
+    if (CONFIG.debug && mouthOpenFrames % 5 === 0) {
+      console.log('Mouth open:', jawOpen.score.toFixed(2));
+    }
   } else {
     mouthOpenFrames = Math.max(0, mouthOpenFrames - 1);
   }
-  if (mouthOpenFrames >= 6) advanceChallengeIf(true);
+  
+  if (mouthOpenFrames >= 4) {
+    if (CONFIG.debug) console.log('Mouth challenge completed!');
+    advanceChallengeIf(true);
+  }
 }
 
 function updateForwardMovement(bounds) {
@@ -407,12 +599,12 @@ function updateForwardMovement(bounds) {
   if (sizeHistory.length >= 10) {
     const first = sizeHistory[0];
     const maxVal = Math.max(...sizeHistory);
-    // Require at least 12% increase in face width
-    if (maxVal > first * 1.12) {
+    // Require at least 8% increase in face width (reduced from 12%)
+    if (maxVal > first * 1.08) {
       forwardMoveFrames++;
     }
   }
-  if (forwardMoveFrames >= 3) advanceChallengeIf(true);
+  if (forwardMoveFrames >= 2) advanceChallengeIf(true); // Reduced from 3 to 2 frames
 }
 
 // Spoof heuristics ------------------------------------------------------
@@ -493,9 +685,12 @@ function loop() {
 
     const earL = computeEAR(lms, LEFT_EYE);
     const earR = computeEAR(lms, RIGHT_EYE);
+    const blendshapes = out.faceBlendshapes && out.faceBlendshapes.length > 0 ? out.faceBlendshapes[0].categories : null;
+    const transformMatrix = out.facialTransformationMatrixes && out.facialTransformationMatrixes.length > 0 ? out.facialTransformationMatrixes[0] : null;
+    
     updateBlink(earL, earR);
-    updateMovement(bounds);
-    updateMouthOpen(lms, bounds);
+    updateMovement(transformMatrix);
+    updateMouthOpen(blendshapes);
     updateForwardMovement(bounds);
     analyzeSpoof(video, bounds);
 
@@ -505,7 +700,12 @@ function loop() {
     } else if (CONFIG.earThreshold === null) {
       // Calibration messaging handled earlier
     } else if (!challengeCompleted) {
+      const progress = getChallengeProgress();
       setChallengeStatus(`Do: ${challengeSequence[currentChallengeIndex]?.label || 'Completing…'}`, 'warn');
+      // Update progress every few frames to avoid excessive re-renders
+      if (Math.floor(performance.now() / 100) % 2 === 0) {
+        renderChallengeList(progress);
+      }
     } else {
       setChallengeStatus('Challenges complete.', 'ok');
       setStatus('Evaluating result…', 'ok');
@@ -515,13 +715,42 @@ function loop() {
     if (CONFIG.debug && CONFIG.earThreshold !== null) {
       ctx.save();
       ctx.fillStyle = "rgba(0,0,0,0.5)";
-      ctx.fillRect(8, 8, 210, 70);
+      ctx.fillRect(8, 8, 320, 145);
       ctx.fillStyle = "#00d0ff";
       ctx.font = "12px monospace";
-      ctx.fillText(`EAR raw: ${(earL+earR)/2}.3`, 16, 24);
+      ctx.fillText(`EAR raw: ${((earL+earR)/2).toFixed(3)}`, 16, 24);
       ctx.fillText(`EAR smooth: ${smoothEAR.toFixed(3)}`, 16, 38);
       ctx.fillText(`Threshold: ${CONFIG.earThreshold.toFixed(3)}`, 16, 52);
       ctx.fillText(`Blinks: ${blinkCount}`, 16, 66);
+      const currentAction = challengeSequence[currentChallengeIndex]?.key;
+      let progressFrames = 0;
+      if (currentAction === 'turnLeft') progressFrames = moveLeftFrames;
+      if (currentAction === 'turnRight') progressFrames = moveRightFrames;
+      if (currentAction === 'mouth') progressFrames = mouthOpenFrames;
+      if (currentAction === 'forward') progressFrames = forwardMoveFrames;
+      
+      // Show blend shape info
+      const blendshapes = out.faceBlendshapes && out.faceBlendshapes.length > 0 ? out.faceBlendshapes[0].categories : null;
+      const jawOpen = blendshapes ? blendshapes.find(b => b.categoryName === 'jawOpen') : null;
+      const transformMatrix = out.facialTransformationMatrixes && out.facialTransformationMatrixes.length > 0 ? out.facialTransformationMatrixes[0] : null;
+      const currentYaw = transformMatrix ? getYawFromMatrix(transformMatrix) : null;
+      const yawDiff = baseYaw !== null && currentYaw !== null ? currentYaw - baseYaw : null;
+      
+      ctx.fillText(`Move L: ${moveLeftFrames} R: ${moveRightFrames} (need ${CONFIG.moveMinFrames})`, 16, 80);
+      ctx.fillText(`Mouth: ${mouthOpenFrames}/4 | JawOpen: ${jawOpen ? jawOpen.score.toFixed(2) : 'N/A'}`, 16, 94);
+      ctx.fillText(`Head Yaw: ${yawDiff !== null ? yawDiff.toFixed(1) : 'calibrating'}° (base: ${baseYaw ? baseYaw.toFixed(1) : 'N/A'}°)`, 16, 108);
+      ctx.fillText(`MoveCal: ${movementCalibrated} | AtCenter: ${returnedToCenter}`, 16, 122);
+      
+      // Progress bar for current challenge
+      if (progressFrames > 0 && currentAction) {
+        const maxFrames = currentAction === 'turnLeft' || currentAction === 'turnRight' ? CONFIG.moveMinFrames : 
+                         currentAction === 'mouth' ? 4 : 2;
+        const progress = Math.min(progressFrames / maxFrames, 1);
+        ctx.fillStyle = "rgba(23,201,100,0.7)";
+        ctx.fillRect(16, 132, 200 * progress, 6);
+        ctx.strokeStyle = "rgba(255,255,255,0.3)";
+        ctx.strokeRect(16, 132, 200, 6);
+      }
       ctx.restore();
     }
 
